@@ -1,0 +1,60 @@
+name: Test & Deploy Loan Bot
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main, develop ]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    
+    strategy:
+      matrix:
+        python-version: ['3.8', '3.9', '3.10']
+    
+    steps:
+    - uses: actions/checkout@v3
+    
+    - name: Set up Python ${{ matrix.python-version }}
+      uses: actions/setup-python@v4
+      with:
+        python-version: ${{ matrix.python-version }}
+    
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+        pip install pytest pytest-cov flake8
+    
+    - name: Lint with flake8
+      run: |
+        # Stop the build if there are Python syntax errors or undefined names
+        flake8 loan_bot.py --count --select=E9,F63,F7,F82 --show-source --statistics
+        # Exit-zero treats all errors as warnings
+        flake8 loan_bot.py --count --exit-zero --max-complexity=10 --max-line-length=127 --statistics
+    
+    - name: Verify Excel file exists
+      run: |
+        if [ -f "Loan_Bot_Database_NEW.xlsx" ]; then echo "Excel file found"; else echo "Excel file missing"; exit 1; fi
+
+  deploy:
+    needs: test
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    
+    steps:
+    - uses: actions/checkout@v3
+    
+    - name: Deploy to Render (if webhook configured)
+      run: |
+        if [ -n "${{ secrets.RENDER_DEPLOY_HOOK }}" ]; then
+          curl "${{ secrets.RENDER_DEPLOY_HOOK }}"
+        fi
+    
+    - name: Deploy to Railway (if webhook configured)
+      run: |
+        if [ -n "${{ secrets.RAILWAY_DEPLOY_HOOK }}" ]; then
+          curl "${{ secrets.RAILWAY_DEPLOY_HOOK }}"
+        fi
