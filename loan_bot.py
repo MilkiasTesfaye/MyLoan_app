@@ -11,7 +11,7 @@ import os
 from datetime import datetime
 from enum import Enum
 from typing import Dict, List, Optional
-import pandas as pd
+import openpyxl
 from dotenv import load_dotenv
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, ReplyKeyboardRemove
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, ConversationHandler, ContextTypes, filters
@@ -30,21 +30,14 @@ logger = logging.getLogger(__name__)
 # Configuration from environment variables
 BOT_TOKEN = os.getenv('BOT_TOKEN')
 DATABASE_PATH = os.getenv('DATABASE_PATH', '/mnt/user-data/uploads/Loan_Bot_Database_NEW.xlsx')
-ENVIRONMENT = os.getenv('ENVIRONMENT', 'development')
-LOG_LEVEL = os.getenv('LOG_LEVEL', 'INFO')
+ENVIRONMENT = os.getenv('ENVIRONMENT', 'production')
 
 # Validate bot token
 if not BOT_TOKEN:
-    logger.error("❌ BOT_TOKEN not found! Set it as environment variable or in .env file")
-    raise ValueError("BOT_TOKEN is required. Set in environment variables or .env file")
-
-# Validate database file exists
-if not os.path.exists(DATABASE_PATH):
-    logger.error(f"❌ Database file not found at: {DATABASE_PATH}")
-    raise FileNotFoundError(f"Database file not found at: {DATABASE_PATH}")
+    logger.error("❌ BOT_TOKEN not found! Set it as environment variable")
+    raise ValueError("BOT_TOKEN is required")
 
 logger.info(f"✅ Bot Token: {BOT_TOKEN[:10]}...")
-logger.info(f"✅ Database: {DATABASE_PATH}")
 logger.info(f"✅ Environment: {ENVIRONMENT}")
 
 # Conversation states
@@ -68,26 +61,78 @@ class State(Enum):
     REG_PRIORITY = 16
     REG_COMMENTS = 17
 
-# Load data from Excel
+# Load data from Excel using openpyxl
 def load_excel_data(filepath):
-    """Load all data from Excel file"""
+    """Load data from Excel file"""
     logger.info(f"Loading data from: {filepath}")
-    excel_file = pd.ExcelFile(filepath)
+    
     data = {}
+    wb = openpyxl.load_workbook(filepath)
     
-    for sheet in excel_file.sheet_names:
-        data[sheet] = pd.read_excel(filepath, sheet_name=sheet).fillna('').to_dict('records')
-        logger.info(f"  ✅ Loaded {sheet}: {len(data[sheet])} records")
+    # Load MFI Master Data
+    ws = wb['MFI Master Data']
+    data['MFI Master Data'] = []
+    for row in ws.iter_rows(min_row=2, values_only=True):
+        if row[0]:  # If first column has data
+            data['MFI Master Data'].append({
+                'MFI ID': row[0],
+                'MFI Name': row[1],
+                'Country': row[2],
+                'Description': row[3],
+                'Phone Number': row[4]
+            })
     
+    # Load Loan Types
+    ws = wb['Loan Types']
+    data['Loan Types'] = []
+    for row in ws.iter_rows(min_row=2, values_only=True):
+        if row[0]:
+            data['Loan Types'].append({
+                'Loan Type ID': row[0],
+                'Loan Type Name': row[1],
+                'Description': row[2]
+            })
+    
+    # Load Interest Rates & Terms (first row)
+    ws = wb['Interest Rates & Terms']
+    row = list(ws.iter_rows(min_row=2, max_row=2, values_only=True))[0]
+    data['Rates'] = {
+        'Annual Interest Rate (%)': row[1],
+        'Min Amount (USD)': row[2],
+        'Max Amount (USD)': row[3],
+        'Repayment Period (Months)': row[4],
+        'Processing Fee (%)': row[5]
+    }
+    
+    # Load Requirements
+    ws = wb['Requirements']
+    data['Requirements'] = []
+    for row in ws.iter_rows(min_row=2, values_only=True):
+        if row[0]:
+            data['Requirements'].append({
+                'Requirement': row[0],
+                'Description': row[1]
+            })
+    
+    # Load Countries
+    ws = wb['Countries']
+    data['Countries'] = []
+    for row in ws.iter_rows(min_row=2, values_only=True):
+        if row[0]:
+            data['Countries'].append({
+                'Country Code': row[0],
+                'Country Name': row[1],
+                'Currency': row[2]
+            })
+    
+    logger.info("✅ All data loaded successfully!")
     return data
 
-# Convert data to JSON-friendly format
+# Load Excel data
 EXCEL_DATA = load_excel_data(DATABASE_PATH)
 
 # Build lookups
 COUNTRIES = {item['Country Code']: item['Country Name'] for item in EXCEL_DATA['Countries']}
-COUNTRY_NAMES = {v: k for k, v in COUNTRIES.items()}
-
 MFI_DATA = {item['MFI ID']: item for item in EXCEL_DATA['MFI Master Data']}
 MFIS_BY_COUNTRY = {}
 for mfi in EXCEL_DATA['MFI Master Data']:
@@ -98,60 +143,26 @@ for mfi in EXCEL_DATA['MFI Master Data']:
 
 LOAN_TYPES = {item['Loan Type ID']: item for item in EXCEL_DATA['Loan Types']}
 LOAN_TYPES_LIST = EXCEL_DATA['Loan Types']
-
 REQUIREMENTS = EXCEL_DATA['Requirements']
-RATES = EXCEL_DATA['Interest Rates & Terms'][0]
-CALC_SETTINGS = {item['Setting']: item['Value'] for item in EXCEL_DATA['Calculator Settings']}
-
-logger.info("✅ All data loaded successfully!")
-
-# Helper functions
-def get_loan_type_name(loan_type_id):
-    """Get loan type name from ID"""
-    for loan in LOAN_TYPES_LIST:
-        if loan['Loan Type ID'] == loan_type_id:
-            return loan['Loan Type Name']
-    return loan_type_id
+RATES = EXCEL_DATA['Rates']
 
 def format_currency(amount, currency='USD'):
-    """Format currency with appropriate symbol"""
+    """Format currency"""
     symbols = {'USD': '$', 'ETB': 'Br', 'KES': 'Ksh', 'RWF': 'FRw', 'UGX': 'Ush'}
     symbol = symbols.get(currency, currency)
     return f"{symbol}{amount:,.0f}"
 
 def calculate_monthly_payment(principal, annual_rate, months):
-    """Calculate monthly payment using loan formula"""
+    """Calculate monthly payment"""
     monthly_rate = annual_rate / 100 / 12
     if monthly_rate == 0:
         return principal / months
     payment = principal * (monthly_rate * (1 + monthly_rate)**months) / ((1 + monthly_rate)**months - 1)
     return payment
 
-def calculate_amortization_schedule(principal, annual_rate, months):
-    """Generate amortization schedule"""
-    schedule = []
-    monthly_rate = annual_rate / 100 / 12
-    remaining = principal
-    
-    for month in range(1, min(months + 1, 13)):
-        payment = calculate_monthly_payment(principal, annual_rate, months)
-        interest = remaining * monthly_rate
-        principal_payment = payment - interest
-        remaining -= principal_payment
-        
-        schedule.append({
-            'month': month,
-            'payment': payment,
-            'principal': principal_payment,
-            'interest': interest,
-            'remaining': max(0, remaining)
-        })
-    
-    return schedule
-
 # Telegram Bot Handlers
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Start the conversation and show main menu"""
+    """Start the conversation"""
     logger.info(f"User {update.effective_user.id} started bot")
     
     keyboard = [
@@ -164,8 +175,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     
     await update.message.reply_text(
         "🤖 *Welcome to Loan Bot* 🤖\n\n"
-        "I help schools find microfinance institutions (MFIs) and calculate loans for "
-        "educational technology, infrastructure, and development projects.\n\n"
+        "I help schools find microfinance institutions and calculate loans.\n\n"
         "What would you like to do?",
         reply_markup=reply_markup,
         parse_mode=ParseMode.MARKDOWN
@@ -174,7 +184,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     return State.START.value
 
 async def main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Handle main menu selection"""
+    """Handle main menu"""
     query = update.callback_query
     await query.answer()
     
@@ -185,7 +195,7 @@ async def main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         reply_markup = InlineKeyboardMarkup(keyboard)
         
         await query.edit_message_text(
-            "*Select Your Country* 🌍\n\n",
+            "*Select Your Country* 🌍",
             reply_markup=reply_markup,
             parse_mode=ParseMode.MARKDOWN
         )
@@ -193,44 +203,33 @@ async def main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     
     elif query.data == 'menu_calculator':
         keyboard = [
-            [InlineKeyboardButton("EdTech Loan (18%)", callback_data='calc_LOAN001')],
-            [InlineKeyboardButton("School Development Loan (24%)", callback_data='calc_LOAN002')],
-            [InlineKeyboardButton("Development Loan (24%)", callback_data='calc_LOAN003')],
+            [InlineKeyboardButton("EdTech Loan", callback_data='calc_LOAN001')],
+            [InlineKeyboardButton("School Development Loan", callback_data='calc_LOAN002')],
+            [InlineKeyboardButton("Development Loan", callback_data='calc_LOAN003')],
             [InlineKeyboardButton("⬅️ Back", callback_data='back_menu')],
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
         
         await query.edit_message_text(
-            "*Loan Calculator* 📊\n\n"
-            "Select a loan type to calculate monthly payments:",
+            "*Loan Calculator* 📊",
             reply_markup=reply_markup,
             parse_mode=ParseMode.MARKDOWN
         )
         return State.LOAN_CALCULATOR.value
     
     elif query.data == 'menu_register':
-        context.user_data['registration'] = {}
         await query.edit_message_text(
-            "*📋 Registration Form*\n\n"
-            "Let's start your loan application. What's your full name?",
-            parse_mode=ParseMode.MARKDOWN
+            "📋 Registration coming soon!"
         )
-        return State.REG_NAME.value
+        return State.START.value
     
     elif query.data == 'menu_faq':
         await query.edit_message_text(
-            "*❓ Frequently Asked Questions*\n\n"
-            "*What is a loan calculator?*\n"
-            "It helps you estimate monthly payments, total interest, and repayment schedule.\n\n"
-            "*What are the eligibility requirements?*\n"
-            "• School registered with Ministry of Education\n"
-            "• Operating for minimum 1 year\n"
-            "• Bank account for the school\n"
-            "• Minimum 5 teaching staff\n"
-            "• Minimum 100 students\n"
-            "• 6 months financial records\n\n"
-            "*Can I change my loan amount later?*\n"
-            "You can modify during registration. Once submitted, contact the MFI directly.\n\n",
+            "*❓ FAQ*\n\n"
+            "*What is this bot?*\n"
+            "Helps schools access educational microfinance.\n\n"
+            "*Who can apply?*\n"
+            "Registered schools with 1+ year operation.\n\n",
             parse_mode=ParseMode.MARKDOWN
         )
         keyboard = [[InlineKeyboardButton("⬅️ Back", callback_data='back_menu')]]
@@ -255,7 +254,7 @@ async def select_country(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     
     mfis = MFIS_BY_COUNTRY.get(country, [])
     
-    message = f"*🏦 MFIs in {country}* 🏦\n\n"
+    message = f"*🏦 MFIs in {country}*\n\n"
     keyboard = []
     
     for mfi in mfis:
@@ -350,7 +349,6 @@ async def select_loan_type(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     loan = LOAN_TYPES[loan_id]
     mfi_name = context.user_data.get('mfi_name', 'MFI')
     context.user_data['loan_type_id'] = loan_id
-    context.user_data['loan_type_name'] = loan['Loan Type Name']
     
     message = f"*{loan['Loan Type Name']} @ {mfi_name}*\n\n" \
               f"{loan['Description']}\n\n" \
@@ -363,11 +361,9 @@ async def select_loan_type(update: Update, context: ContextTypes.DEFAULT_TYPE) -
               f"*✅ Eligibility Requirements:*\n"
     
     for req in REQUIREMENTS:
-        message += f"• {req['Requirement']}: {req['Description']}\n"
+        message += f"• {req['Requirement']}\n"
     
     keyboard = [
-        [InlineKeyboardButton("🧮 Calculate Monthly Payment", callback_data=f'calc_detail_{loan_id}')],
-        [InlineKeyboardButton("📋 Apply Now", callback_data='menu_register')],
         [InlineKeyboardButton("⬅️ Back", callback_data='back_loan')],
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
@@ -389,445 +385,67 @@ async def loan_calculator(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await start(update, context)
         return State.START.value
     
-    if query.data.startswith('calc_'):
-        loan_id = query.data.replace('calc_', '').replace('LOAN', 'LOAN')
-    else:
-        loan_id = query.data.replace('calc_detail_', '')
-    
+    loan_id = query.data.replace('calc_', '')
     loan = LOAN_TYPES.get(loan_id, {})
     context.user_data['calc_loan_id'] = loan_id
     
-    message = f"*🧮 Loan Calculator - {loan.get('Loan Type Name', 'Loan')}*\n\n" \
-              f"Annual Interest Rate: *{RATES['Annual Interest Rate (%)']}%*\n" \
-              f"Processing Fee: *{RATES['Processing Fee (%)']}%*\n\n" \
-              f"Enter the loan amount (in USD) you want to borrow:\n\n" \
-              f"(Between {format_currency(RATES['Min Amount (USD)'])} and " \
-              f"{format_currency(RATES['Max Amount (USD)'])})"
-    
-    keyboard = [[InlineKeyboardButton("⬅️ Back", callback_data='back_menu')]]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    
     await query.edit_message_text(
-        message,
-        reply_markup=reply_markup,
-        parse_mode=ParseMode.MARKDOWN
-    )
-    
-    await update.callback_query.message.reply_text(
-        "Please enter the loan amount (numbers only):",
-        reply_markup=ReplyKeyboardRemove()
+        f"💰 Enter loan amount (between {format_currency(RATES['Min Amount (USD)'])} "
+        f"and {format_currency(RATES['Max Amount (USD)'])})"
     )
     
     return State.LOAN_CALCULATOR.value
 
 async def calculator_amount_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Process loan amount input for calculator"""
+    """Process loan amount"""
     try:
         amount = float(update.message.text.replace(',', ''))
         
         if amount < RATES['Min Amount (USD)'] or amount > RATES['Max Amount (USD)']:
-            await update.message.reply_text(
-                f"❌ Amount must be between {format_currency(RATES['Min Amount (USD)'])} "
-                f"and {format_currency(RATES['Max Amount (USD)'])}\n\n"
-                f"Please enter a valid amount:"
-            )
+            await update.message.reply_text(f"Amount must be between {format_currency(RATES['Min Amount (USD)'])} and {format_currency(RATES['Max Amount (USD)'])}")
             return State.LOAN_CALCULATOR.value
         
-        context.user_data['calc_amount'] = amount
-        loan_id = context.user_data.get('calc_loan_id', 'LOAN001')
-        loan = LOAN_TYPES.get(loan_id, {})
+        monthly_payment = calculate_monthly_payment(amount, RATES['Annual Interest Rate (%)'], RATES['Repayment Period (Months)'])
+        total_paid = monthly_payment * RATES['Repayment Period (Months)']
+        total_interest = total_paid - amount
+        
+        message = f"*💰 Calculation Results*\n\n" \
+                  f"Loan Amount: {format_currency(amount)}\n" \
+                  f"Monthly Payment: *{format_currency(monthly_payment)}*\n" \
+                  f"Total Interest: {format_currency(total_interest)}\n" \
+                  f"Total Amount to Pay: {format_currency(total_paid)}\n"
         
         keyboard = [
-            [InlineKeyboardButton("24 months", callback_data='period_24')],
-            [InlineKeyboardButton("36 months (Default)", callback_data='period_36')],
-            [InlineKeyboardButton("48 months", callback_data='period_48')],
-            [InlineKeyboardButton("60 months", callback_data='period_60')],
-            [InlineKeyboardButton("⬅️ Back", callback_data='back_menu')],
+            [InlineKeyboardButton("⬅️ Back to Menu", callback_data='back_menu')],
         ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
         
         await update.message.reply_text(
-            f"Selected Amount: *{format_currency(amount)}*\n\n"
-            f"Select repayment period:",
-            reply_markup=reply_markup,
+            message,
+            reply_markup=InlineKeyboardMarkup(keyboard),
             parse_mode=ParseMode.MARKDOWN
         )
         
         return State.LOAN_CALCULATOR.value
     
     except ValueError:
-        await update.message.reply_text(
-            "❌ Please enter a valid number (numbers only, no spaces or letters)"
-        )
+        await update.message.reply_text("Please enter a valid number")
         return State.LOAN_CALCULATOR.value
 
-async def calculator_period_selection(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Process repayment period selection"""
-    query = update.callback_query
-    await query.answer()
-    
-    if query.data == 'back_menu':
-        await start(update, context)
-        return State.START.value
-    
-    period = int(query.data.replace('period_', ''))
-    amount = context.user_data.get('calc_amount', 10000)
-    interest_rate = RATES['Annual Interest Rate (%)']
-    processing_fee = RATES['Processing Fee (%)']
-    
-    fee_amount = amount * (processing_fee / 100)
-    principal = amount + fee_amount if CALC_SETTINGS.get('Include Processing Fee in Principal', 'Yes') == 'Yes' else amount
-    
-    monthly_payment = calculate_monthly_payment(principal, interest_rate, period)
-    total_paid = monthly_payment * period
-    total_interest = total_paid - amount
-    
-    message = f"*💰 Loan Calculation Results*\n\n" \
-              f"*Loan Details:*\n" \
-              f"Original Amount: {format_currency(amount)}\n" \
-              f"Processing Fee ({processing_fee}%): {format_currency(fee_amount)}\n" \
-              f"Total Principal: {format_currency(principal)}\n" \
-              f"Annual Interest Rate: {interest_rate}%\n" \
-              f"Repayment Period: {period} months\n\n" \
-              f"*Monthly Payment: {format_currency(monthly_payment)}*\n" \
-              f"Total Interest: {format_currency(total_interest)}\n" \
-              f"Total Amount to Pay: {format_currency(total_paid)}\n\n"
-    
-    if CALC_SETTINGS.get('Show Amortization Schedule', 'Yes') == 'Yes':
-        message += "*📋 First 6 Months Schedule:*\n"
-        schedule = calculate_amortization_schedule(principal, interest_rate, period)
-        
-        for payment in schedule[:6]:
-            message += f"Month {payment['month']}: " \
-                      f"Payment {format_currency(payment['payment'])} " \
-                      f"| Principal {format_currency(payment['principal'])} " \
-                      f"| Interest {format_currency(payment['interest'])}\n"
-    
-    keyboard = [
-        [InlineKeyboardButton("📋 Register for this Loan", callback_data='menu_register')],
-        [InlineKeyboardButton("🔄 Calculate Another", callback_data='menu_calculator')],
-        [InlineKeyboardButton("⬅️ Back to Menu", callback_data='back_menu')],
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    
-    await query.edit_message_text(
-        message,
-        reply_markup=reply_markup,
-        parse_mode=ParseMode.MARKDOWN
-    )
-    
-    return State.LOAN_CALCULATOR.value
-
-# Registration handlers
-async def registration_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Get full name for registration"""
-    name = update.message.text
-    
-    if len(name) > 100:
-        await update.message.reply_text("❌ Name too long (max 100 characters). Please try again:")
-        return State.REG_NAME.value
-    
-    context.user_data['registration']['full_name'] = name
-    
-    await update.message.reply_text(
-        "Thank you! What's your school name?"
-    )
-    return State.REG_SCHOOL.value
-
-async def registration_school(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Get school name"""
-    school = update.message.text
-    
-    if len(school) > 150:
-        await update.message.reply_text("❌ School name too long (max 150 characters). Please try again:")
-        return State.REG_SCHOOL.value
-    
-    context.user_data['registration']['school_name'] = school
-    
-    keyboard = [[InlineKeyboardButton(country, callback_data=f'reg_country_{country}')] 
-               for country in MFIS_BY_COUNTRY.keys()]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    
-    await update.message.reply_text(
-        "Which country is your school located in?",
-        reply_markup=reply_markup
-    )
-    return State.REG_COUNTRY.value
-
-async def registration_country(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Get country"""
-    query = update.callback_query
-    await query.answer()
-    
-    country = query.data.replace('reg_country_', '')
-    context.user_data['registration']['country'] = country
-    
-    await query.edit_message_text(
-        "What's your district/zone/city?"
-    )
-    await query.message.reply_text(
-        "Please enter your location:",
-        reply_markup=ReplyKeyboardRemove()
-    )
-    
-    return State.REG_LOCATION.value
-
-async def registration_location(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Get location"""
-    location = update.message.text
-    
-    if len(location) > 50:
-        await update.message.reply_text("❌ Location too long (max 50 characters). Please try again:")
-        return State.REG_LOCATION.value
-    
-    context.user_data['registration']['location'] = location
-    
-    await update.message.reply_text(
-        "What's your phone number?\n(Format: +XXX-XXX-XXXXXX)"
-    )
-    return State.REG_PHONE.value
-
-async def registration_phone(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Get phone number"""
-    phone = update.message.text
-    
-    if not re.match(r'^\+?\d{1,3}[-.\s]?\d{1,14}$', phone) or len(phone) > 14:
-        await update.message.reply_text(
-            "❌ Invalid phone number format. Please use format like +256-704-789012"
-        )
-        return State.REG_PHONE.value
-    
-    context.user_data['registration']['phone'] = phone
-    
-    await update.message.reply_text(
-        "What's your email address?"
-    )
-    return State.REG_EMAIL.value
-
-async def registration_email(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Get email"""
-    email = update.message.text
-    
-    if not re.match(r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$', email):
-        await update.message.reply_text(
-            "❌ Invalid email format. Please enter a valid email."
-        )
-        return State.REG_EMAIL.value
-    
-    context.user_data['registration']['email'] = email
-    
-    keyboard = [[InlineKeyboardButton(loan['Loan Type Name'], callback_data=f'reg_loan_{loan["Loan Type ID"]}')] 
-               for loan in LOAN_TYPES_LIST]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    
-    await update.message.reply_text(
-        "Which loan type are you interested in?",
-        reply_markup=reply_markup
-    )
-    return State.REG_LOAN_TYPE.value
-
-async def registration_loan_type(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Get loan type"""
-    query = update.callback_query
-    await query.answer()
-    
-    loan_id = query.data.replace('reg_loan_', '')
-    context.user_data['registration']['loan_type'] = loan_id
-    
-    await query.edit_message_text(
-        f"Enter the loan amount you need (USD):\n"
-        f"(Between {format_currency(RATES['Min Amount (USD)'])} and {format_currency(RATES['Max Amount (USD)'])})"
-    )
-    await query.message.reply_text(
-        "Please enter the loan amount (numbers only):",
-        reply_markup=ReplyKeyboardRemove()
-    )
-    
-    return State.REG_AMOUNT.value
-
-async def registration_amount(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Get loan amount"""
-    try:
-        amount = float(update.message.text.replace(',', ''))
-        
-        if amount < RATES['Min Amount (USD)'] or amount > RATES['Max Amount (USD)']:
-            await update.message.reply_text(
-                f"❌ Amount must be between {format_currency(RATES['Min Amount (USD)'])} "
-                f"and {format_currency(RATES['Max Amount (USD)'])}\n"
-                f"Please try again:"
-            )
-            return State.REG_AMOUNT.value
-        
-        context.user_data['registration']['loan_amount'] = amount
-        
-        keyboard = [
-            [InlineKeyboardButton("24 months", callback_data='reg_period_24')],
-            [InlineKeyboardButton("36 months", callback_data='reg_period_36')],
-            [InlineKeyboardButton("48 months", callback_data='reg_period_48')],
-            [InlineKeyboardButton("60 months", callback_data='reg_period_60')],
-        ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        
-        await update.message.reply_text(
-            "Select preferred repayment period:",
-            reply_markup=reply_markup
-        )
-        return State.REG_PERIOD.value
-    
-    except ValueError:
-        await update.message.reply_text("❌ Please enter a valid number")
-        return State.REG_AMOUNT.value
-
-async def registration_period(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Get repayment period"""
-    query = update.callback_query
-    await query.answer()
-    
-    period = int(query.data.replace('reg_period_', ''))
-    context.user_data['registration']['repayment_period'] = period
-    
-    keyboard = [
-        [InlineKeyboardButton("🔴 High", callback_data='reg_priority_High')],
-        [InlineKeyboardButton("🟡 Medium", callback_data='reg_priority_Medium')],
-        [InlineKeyboardButton("🟢 Low", callback_data='reg_priority_Low')],
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    
-    await query.edit_message_text(
-        "What's your application priority?",
-        reply_markup=reply_markup
-    )
-    return State.REG_PRIORITY.value
-
-async def registration_priority(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Get application priority"""
-    query = update.callback_query
-    await query.answer()
-    
-    priority = query.data.replace('reg_priority_', '')
-    context.user_data['registration']['priority'] = priority
-    
-    await query.edit_message_text(
-        "Any additional comments or notes? (Optional - you can skip by typing 'NONE')"
-    )
-    await query.message.reply_text(
-        "Enter your comments (or 'NONE' to skip):",
-        reply_markup=ReplyKeyboardRemove()
-    )
-    
-    return State.REG_COMMENTS.value
-
-async def registration_comments(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Get comments and submit"""
-    comments = update.message.text
-    
-    if comments.upper() != 'NONE':
-        if len(comments) > 500:
-            await update.message.reply_text("❌ Comments too long (max 500 characters). Please try again:")
-            return State.REG_COMMENTS.value
-        context.user_data['registration']['comments'] = comments
-    
-    reg = context.user_data['registration']
-    loan_type_name = get_loan_type_name(reg['loan_type'])
-    
-    summary = f"*📋 Application Summary*\n\n" \
-              f"*Personal Information:*\n" \
-              f"Full Name: {reg['full_name']}\n" \
-              f"School: {reg['school_name']}\n" \
-              f"Location: {reg['location']}, {reg['country']}\n" \
-              f"Phone: {reg['phone']}\n" \
-              f"Email: {reg['email']}\n\n" \
-              f"*Loan Details:*\n" \
-              f"Loan Type: {loan_type_name}\n" \
-              f"Amount Requested: {format_currency(reg['loan_amount'])}\n" \
-              f"Repayment Period: {reg['repayment_period']} months\n" \
-              f"Interest Rate: {RATES['Annual Interest Rate (%)']}%\n" \
-              f"Application Priority: {reg['priority']}\n"
-    
-    if 'comments' in reg:
-        summary += f"\nComments: {reg['comments']}\n"
-    
-    keyboard = [
-        [InlineKeyboardButton("✅ Confirm & Submit", callback_data='confirm_submit')],
-        [InlineKeyboardButton("❌ Cancel", callback_data='cancel_submit')],
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    
-    await update.message.reply_text(
-        summary + "\n\nPlease review and confirm your application:",
-        reply_markup=reply_markup,
-        parse_mode=ParseMode.MARKDOWN
-    )
-    
-    return State.REGISTRATION.value
-
-async def registration_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Handle final submission confirmation"""
-    query = update.callback_query
-    await query.answer()
-    
-    if query.data == 'cancel_submit':
-        await query.edit_message_text(
-            "❌ Application cancelled. Thank you for your interest!"
-        )
-        await start(update, context)
-        return State.START.value
-    
-    reg = context.user_data['registration']
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    
-    application_data = {
-        'timestamp': timestamp,
-        'user_id': update.effective_user.id,
-        'username': update.effective_user.username or 'N/A',
-        **reg
-    }
-    
-    logger.info(f"New Application: {json.dumps(application_data, indent=2)}")
-    
-    loan_type_name = get_loan_type_name(reg['loan_type'])
-    
-    success_message = f"*✅ Application Submitted Successfully!*\n\n" \
-                     f"Thank you for submitting your loan application!\n\n" \
-                     f"*Next Steps:*\n" \
-                     f"1. We will review your application\n" \
-                     f"2. Contact you at {reg['phone']} within 24-48 hours\n" \
-                     f"3. Schedule an interview if approved\n\n" \
-                     f"*Your Application Number:* APP{timestamp.replace('-', '').replace(':', '').replace(' ', '')}\n\n" \
-                     f"*Quick Summary:*\n" \
-                     f"School: {reg['school_name']}\n" \
-                     f"Loan Type: {loan_type_name}\n" \
-                     f"Amount: {format_currency(reg['loan_amount'])}\n" \
-                     f"Period: {reg['repayment_period']} months\n"
-    
-    keyboard = [[InlineKeyboardButton("🏠 Back to Menu", callback_data='back_menu')]]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    
-    await query.edit_message_text(
-        success_message,
-        reply_markup=reply_markup,
-        parse_mode=ParseMode.MARKDOWN
-    )
-    
-    return State.START.value
-
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Cancel the conversation"""
-    await update.message.reply_text("Conversation cancelled.")
+    """Cancel"""
+    await update.message.reply_text("Cancelled.")
     return ConversationHandler.END
 
 def main():
     """Start the bot"""
     logger.info("🚀 Starting Loan Bot...")
     
-    # Verify bot token before creating app
-    if not BOT_TOKEN or BOT_TOKEN == 'your_bot_token_here':
-        logger.error("❌ ERROR: Invalid or missing BOT_TOKEN!")
-        logger.error("Set BOT_TOKEN as environment variable or in .env file")
-        raise ValueError("BOT_TOKEN is required and must be valid")
+    if not BOT_TOKEN:
+        logger.error("❌ BOT_TOKEN is required!")
+        raise ValueError("BOT_TOKEN not set")
     
     application = Application.builder().token(BOT_TOKEN).build()
-    logger.info("✅ Application created successfully")
+    logger.info("✅ Application created")
     
     conv_handler = ConversationHandler(
         entry_points=[CommandHandler('start', start)],
@@ -838,22 +456,9 @@ def main():
             State.SELECT_LOAN_TYPE.value: [CallbackQueryHandler(select_loan_type)],
             State.VIEW_LOAN_INFO.value: [CallbackQueryHandler(loan_calculator)],
             State.LOAN_CALCULATOR.value: [
-                CallbackQueryHandler(calculator_period_selection, pattern='^period_'),
                 CallbackQueryHandler(loan_calculator),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, calculator_amount_input)
             ],
-            State.REG_NAME.value: [MessageHandler(filters.TEXT & ~filters.COMMAND, registration_name)],
-            State.REG_SCHOOL.value: [MessageHandler(filters.TEXT & ~filters.COMMAND, registration_school)],
-            State.REG_COUNTRY.value: [CallbackQueryHandler(registration_country)],
-            State.REG_LOCATION.value: [MessageHandler(filters.TEXT & ~filters.COMMAND, registration_location)],
-            State.REG_PHONE.value: [MessageHandler(filters.TEXT & ~filters.COMMAND, registration_phone)],
-            State.REG_EMAIL.value: [MessageHandler(filters.TEXT & ~filters.COMMAND, registration_email)],
-            State.REG_LOAN_TYPE.value: [CallbackQueryHandler(registration_loan_type)],
-            State.REG_AMOUNT.value: [MessageHandler(filters.TEXT & ~filters.COMMAND, registration_amount)],
-            State.REG_PERIOD.value: [CallbackQueryHandler(registration_period)],
-            State.REG_PRIORITY.value: [CallbackQueryHandler(registration_priority)],
-            State.REG_COMMENTS.value: [MessageHandler(filters.TEXT & ~filters.COMMAND, registration_comments)],
-            State.REGISTRATION.value: [CallbackQueryHandler(registration_confirm)],
         },
         fallbacks=[CommandHandler('cancel', cancel)]
     )
@@ -862,7 +467,6 @@ def main():
     
     logger.info("✅ Bot configured successfully")
     logger.info("🚀 Bot is now running...")
-    logger.info(f"Environment: {ENVIRONMENT}")
     
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
