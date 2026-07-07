@@ -1,19 +1,24 @@
 #!/usr/bin/env python3
 """
 Telegram Loan Bot for Educational Institutions
-Helps users find MFIs, calculate loans, and register for applications
+Deploy-ready version with environment variable support
 """
 
 import logging
 import json
 import re
+import os
 from datetime import datetime
 from enum import Enum
 from typing import Dict, List, Optional
 import pandas as pd
+from dotenv import load_dotenv
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, ReplyKeyboardRemove
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, ConversationHandler, ContextTypes, filters
 from telegram.constants import ParseMode
+
+# Load environment variables
+load_dotenv()
 
 # Enable logging
 logging.basicConfig(
@@ -21,6 +26,26 @@ logging.basicConfig(
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
+
+# Configuration from environment variables
+BOT_TOKEN = os.getenv('BOT_TOKEN')
+DATABASE_PATH = os.getenv('DATABASE_PATH', '/mnt/user-data/uploads/Loan_Bot_Database_NEW.xlsx')
+ENVIRONMENT = os.getenv('ENVIRONMENT', 'development')
+LOG_LEVEL = os.getenv('LOG_LEVEL', 'INFO')
+
+# Validate bot token
+if not BOT_TOKEN:
+    logger.error("❌ BOT_TOKEN not found! Set it as environment variable or in .env file")
+    raise ValueError("BOT_TOKEN is required. Set in environment variables or .env file")
+
+# Validate database file exists
+if not os.path.exists(DATABASE_PATH):
+    logger.error(f"❌ Database file not found at: {DATABASE_PATH}")
+    raise FileNotFoundError(f"Database file not found at: {DATABASE_PATH}")
+
+logger.info(f"✅ Bot Token: {BOT_TOKEN[:10]}...")
+logger.info(f"✅ Database: {DATABASE_PATH}")
+logger.info(f"✅ Environment: {ENVIRONMENT}")
 
 # Conversation states
 class State(Enum):
@@ -46,16 +71,18 @@ class State(Enum):
 # Load data from Excel
 def load_excel_data(filepath):
     """Load all data from Excel file"""
+    logger.info(f"Loading data from: {filepath}")
     excel_file = pd.ExcelFile(filepath)
     data = {}
     
     for sheet in excel_file.sheet_names:
         data[sheet] = pd.read_excel(filepath, sheet_name=sheet).fillna('').to_dict('records')
+        logger.info(f"  ✅ Loaded {sheet}: {len(data[sheet])} records")
     
     return data
 
 # Convert data to JSON-friendly format
-EXCEL_DATA = load_excel_data('/mnt/user-data/uploads/Loan_Bot_Database_NEW.xlsx')
+EXCEL_DATA = load_excel_data(DATABASE_PATH)
 
 # Build lookups
 COUNTRIES = {item['Country Code']: item['Country Name'] for item in EXCEL_DATA['Countries']}
@@ -73,8 +100,10 @@ LOAN_TYPES = {item['Loan Type ID']: item for item in EXCEL_DATA['Loan Types']}
 LOAN_TYPES_LIST = EXCEL_DATA['Loan Types']
 
 REQUIREMENTS = EXCEL_DATA['Requirements']
-RATES = EXCEL_DATA['Interest Rates & Terms'][0]  # All rates are the same in this data
+RATES = EXCEL_DATA['Interest Rates & Terms'][0]
 CALC_SETTINGS = {item['Setting']: item['Value'] for item in EXCEL_DATA['Calculator Settings']}
+
+logger.info("✅ All data loaded successfully!")
 
 # Helper functions
 def get_loan_type_name(loan_type_id):
@@ -104,7 +133,7 @@ def calculate_amortization_schedule(principal, annual_rate, months):
     monthly_rate = annual_rate / 100 / 12
     remaining = principal
     
-    for month in range(1, min(months + 1, 13)):  # Show first 12 months
+    for month in range(1, min(months + 1, 13)):
         payment = calculate_monthly_payment(principal, annual_rate, months)
         interest = remaining * monthly_rate
         principal_payment = payment - interest
@@ -123,6 +152,8 @@ def calculate_amortization_schedule(principal, annual_rate, months):
 # Telegram Bot Handlers
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Start the conversation and show main menu"""
+    logger.info(f"User {update.effective_user.id} started bot")
+    
     keyboard = [
         [InlineKeyboardButton("🏦 MFI List", callback_data='menu_mfis')],
         [InlineKeyboardButton("📊 Loan Calculator", callback_data='menu_calculator')],
@@ -222,14 +253,12 @@ async def select_country(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     country = query.data.replace('country_', '')
     context.user_data['country'] = country
     
-    # Show MFIs for selected country
     mfis = MFIS_BY_COUNTRY.get(country, [])
     
     message = f"*🏦 MFIs in {country}* 🏦\n\n"
     keyboard = []
     
     for mfi in mfis:
-        button_text = f"{mfi['MFI Name']} - {mfi['Description']}"
         message += f"• *{mfi['MFI Name']}*\n  {mfi['Description']}\n  📞 {mfi['Phone Number']}\n\n"
         keyboard.append([InlineKeyboardButton(mfi['MFI Name'], callback_data=f"mfi_{mfi['MFI ID']}")])
     
@@ -267,7 +296,6 @@ async def select_mfi(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data['mfi_id'] = mfi_id
     context.user_data['mfi_name'] = mfi['MFI Name']
     
-    # Show loan types available for this MFI
     message = f"*{mfi['MFI Name']}*\n\n" \
               f"Contact: {mfi['Phone Number']}\n" \
               f"Country: {mfi['Country']}\n\n" \
@@ -324,7 +352,6 @@ async def select_loan_type(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     context.user_data['loan_type_id'] = loan_id
     context.user_data['loan_type_name'] = loan['Loan Type Name']
     
-    # Get rates
     message = f"*{loan['Loan Type Name']} @ {mfi_name}*\n\n" \
               f"{loan['Description']}\n\n" \
               f"*📊 Loan Terms:*\n" \
@@ -362,7 +389,6 @@ async def loan_calculator(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await start(update, context)
         return State.START.value
     
-    # Extract loan type from callback
     if query.data.startswith('calc_'):
         loan_id = query.data.replace('calc_', '').replace('LOAN', 'LOAN')
     else:
@@ -387,7 +413,6 @@ async def loan_calculator(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         parse_mode=ParseMode.MARKDOWN
     )
     
-    # Prompt for amount input
     await update.callback_query.message.reply_text(
         "Please enter the loan amount (numbers only):",
         reply_markup=ReplyKeyboardRemove()
@@ -412,7 +437,6 @@ async def calculator_amount_input(update: Update, context: ContextTypes.DEFAULT_
         loan_id = context.user_data.get('calc_loan_id', 'LOAN001')
         loan = LOAN_TYPES.get(loan_id, {})
         
-        # Ask for repayment period
         keyboard = [
             [InlineKeyboardButton("24 months", callback_data='period_24')],
             [InlineKeyboardButton("36 months (Default)", callback_data='period_36')],
@@ -451,7 +475,6 @@ async def calculator_period_selection(update: Update, context: ContextTypes.DEFA
     interest_rate = RATES['Annual Interest Rate (%)']
     processing_fee = RATES['Processing Fee (%)']
     
-    # Calculate with processing fee
     fee_amount = amount * (processing_fee / 100)
     principal = amount + fee_amount if CALC_SETTINGS.get('Include Processing Fee in Principal', 'Yes') == 'Yes' else amount
     
@@ -470,7 +493,6 @@ async def calculator_period_selection(update: Update, context: ContextTypes.DEFA
               f"Total Interest: {format_currency(total_interest)}\n" \
               f"Total Amount to Pay: {format_currency(total_paid)}\n\n"
     
-    # Show first few months of amortization
     if CALC_SETTINGS.get('Show Amortization Schedule', 'Yes') == 'Yes':
         message += "*📋 First 6 Months Schedule:*\n"
         schedule = calculate_amortization_schedule(principal, interest_rate, period)
@@ -569,7 +591,6 @@ async def registration_phone(update: Update, context: ContextTypes.DEFAULT_TYPE)
     """Get phone number"""
     phone = update.message.text
     
-    # Basic phone validation
     if not re.match(r'^\+?\d{1,3}[-.\s]?\d{1,14}$', phone) or len(phone) > 14:
         await update.message.reply_text(
             "❌ Invalid phone number format. Please use format like +256-704-789012"
@@ -587,7 +608,6 @@ async def registration_email(update: Update, context: ContextTypes.DEFAULT_TYPE)
     """Get email"""
     email = update.message.text
     
-    # Basic email validation
     if not re.match(r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$', email):
         await update.message.reply_text(
             "❌ Invalid email format. Please enter a valid email."
@@ -707,7 +727,6 @@ async def registration_comments(update: Update, context: ContextTypes.DEFAULT_TY
             return State.REG_COMMENTS.value
         context.user_data['registration']['comments'] = comments
     
-    # Prepare submission message
     reg = context.user_data['registration']
     loan_type_name = get_loan_type_name(reg['loan_type'])
     
@@ -754,11 +773,9 @@ async def registration_confirm(update: Update, context: ContextTypes.DEFAULT_TYP
         await start(update, context)
         return State.START.value
     
-    # Save registration (in production, save to database/email)
     reg = context.user_data['registration']
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     
-    # Prepare data for saving
     application_data = {
         'timestamp': timestamp,
         'user_id': update.effective_user.id,
@@ -766,10 +783,8 @@ async def registration_confirm(update: Update, context: ContextTypes.DEFAULT_TYP
         **reg
     }
     
-    # Log the application (in production, send to email or database)
     logger.info(f"New Application: {json.dumps(application_data, indent=2)}")
     
-    # Create success message
     loan_type_name = get_loan_type_name(reg['loan_type'])
     
     success_message = f"*✅ Application Submitted Successfully!*\n\n" \
@@ -801,13 +816,19 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     await update.message.reply_text("Conversation cancelled.")
     return ConversationHandler.END
 
-# Main function
 def main():
     """Start the bot"""
-    # Create the Application
-    application = Application.builder().token("YOUR_BOT_TOKEN_HERE").build()
+    logger.info("🚀 Starting Loan Bot...")
     
-    # Add conversation handler
+    # Verify bot token before creating app
+    if not BOT_TOKEN or BOT_TOKEN == 'your_bot_token_here':
+        logger.error("❌ ERROR: Invalid or missing BOT_TOKEN!")
+        logger.error("Set BOT_TOKEN as environment variable or in .env file")
+        raise ValueError("BOT_TOKEN is required and must be valid")
+    
+    application = Application.builder().token(BOT_TOKEN).build()
+    logger.info("✅ Application created successfully")
+    
     conv_handler = ConversationHandler(
         entry_points=[CommandHandler('start', start)],
         states={
@@ -839,7 +860,10 @@ def main():
     
     application.add_handler(conv_handler)
     
-    # Run the bot
+    logger.info("✅ Bot configured successfully")
+    logger.info("🚀 Bot is now running...")
+    logger.info(f"Environment: {ENVIRONMENT}")
+    
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == '__main__':
