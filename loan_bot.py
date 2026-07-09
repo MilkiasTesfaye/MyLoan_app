@@ -438,6 +438,8 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
 def main():
     """Start the bot"""
+    import asyncio
+    
     logger.info("🚀 Starting Loan Bot...")
     
     if not BOT_TOKEN:
@@ -468,7 +470,11 @@ def main():
     logger.info("✅ Bot configured successfully")
     logger.info("🚀 Bot is now running...")
     
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
+    # Handle Python 3.14 asyncio issue
+    try:
+        asyncio.run(application.run_polling(allowed_updates=Update.ALL_TYPES))
+    except RuntimeError:
+        application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == '__main__':
     main()
